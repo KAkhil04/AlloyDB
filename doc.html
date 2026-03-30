@@ -1,0 +1,865 @@
+<ac:structured-macro ac:name=“toc” ac:schema-version=“1”><ac:parameter ac:name=“maxLevel”>3</ac:parameter><ac:parameter ac:name=“minLevel”>1</ac:parameter><ac:parameter ac:name=“outline”>true</ac:parameter></ac:structured-macro>
+
+<hr />
+<h1>1. Document Overview</h1>
+<p>This document provides comprehensive architectural and operational documentation for Google AlloyDB Omni Operator version 1.6.0 deployed on Red Hat OpenShift Container Platform version 4.16.46, managing AlloyDB Omni database clusters running version 17.5.0. The operator follows a cluster-scoped deployment model where it is installed into the alloydb-omni-system namespace and manages DBCluster resources and their associated components across multiple tenant namespaces.</p>
+<p>AlloyDB Omni is a downloadable, self-managed edition of Google AlloyDB for PostgreSQL. It delivers the high-performance AlloyDB engine—offering more than twice the transactional throughput and up to 100 times faster analytical query performance compared to standard PostgreSQL—packaged as containers managed by a Kubernetes operator. This approach enables automated deployment, lifecycle management, high availability, backup and restore, and monitoring of database instances within enterprise Kubernetes environments.</p>
+<p>This document is intended for platform engineers, database administrators, and DevOps teams responsible for deploying, operating, and maintaining AlloyDB Omni on OpenShift. It covers the operator’s internal architecture, the container images it deploys, the Custom Resource Definitions (CRDs) it introduces, the network flows between components, the high availability model, backup and disaster recovery strategies, and the OpenShift-specific considerations that affect deployment and security.</p>
+<hr />
+<h1>2. Platform &amp; Version Matrix</h1>
+<table data-layout="default"><colgroup><col /><col /><col /></colgroup><tbody>
+<tr><th style="background-color: #1A73E8; color: #ffffff;"><p><strong>Component</strong></p></th><th style="background-color: #1A73E8; color: #ffffff;"><p><strong>Version</strong></p></th><th style="background-color: #1A73E8; color: #ffffff;"><p><strong>Notes</strong></p></th></tr>
+<tr><td style="background-color: #f1f8ff;"><p>AlloyDB Omni Operator</p></td><td style="background-color: #f1f8ff;"><p>1.6.0</p></td><td style="background-color: #f1f8ff;"><p>Cluster-scoped Kubernetes operator (GA release)</p></td></tr>
+<tr><td><p>Helm Chart</p></td><td><p>1.6.0</p></td><td><p>Installation method for disconnected environment</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>AlloyDB Omni Database</p></td><td style="background-color: #f1f8ff;"><p>17.5.0</p></td><td style="background-color: #f1f8ff;"><p>PostgreSQL 17-compatible database engine</p></td></tr>
+<tr><td><p>OpenShift Container Platform</p></td><td><p>4.16.46</p></td><td><p>Red Hat enterprise Kubernetes distribution</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>Kubernetes API Version</p></td><td style="background-color: #f1f8ff;"><p>1.29.x</p></td><td style="background-color: #f1f8ff;"><p>OpenShift 4.16 ships Kubernetes 1.29</p></td></tr>
+<tr><td><p>CRD API Group</p></td><td><p>alloydbomni.dbadmin.goog/v1</p></td><td><p>Custom resource API group for all CRDs</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>Operator Namespace</p></td><td style="background-color: #f1f8ff;"><p>alloydb-omni-system</p></td><td style="background-color: #f1f8ff;"><p>Dedicated namespace for operator controllers</p></td></tr>
+<tr><td><p>Container Base Image</p></td><td><p>UBI 9 (Red Hat Universal Base Image)</p></td><td><p>Since operator version 1.5.0</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>cert-manager</p></td><td style="background-color: #f1f8ff;"><p>1.x (OpenShift Operator)</p></td><td style="background-color: #f1f8ff;"><p>Required dependency for TLS certificate management</p></td></tr>
+<tr><td><p>PgBouncer</p></td><td><p>1.23.x</p></td><td><p>Connection pooling sidecar</p></td></tr>
+</tbody></table>
+<ac:structured-macro ac:name="info" ac:schema-version="1"><ac:rich-text-body><p>The operator version 1.6.0 release includes several important fixes: a memory leak in the local operator that could cause out-of-memory crashes has been resolved, a cache bug that could prevent database startup after a restart has been fixed, and new metrics for Backup and BackupPlan custom resources have been added for improved visibility into backup operations.</p></ac:rich-text-body></ac:structured-macro>
+<h2>2.1 Environment Context</h2>
+<p>This deployment operates in a fully disconnected (air-gapped) OpenShift environment with no direct internet egress. All vendor container images from Google Container Registry (gcr.io/alloydb-omni/) are pulled through an ATAAS-based Quarantine pipeline, scanned with Aqua Security for vulnerabilities and compliance, and published to the company’s internal Artifactory registry. All Kubernetes resource manifests, Helm chart values, and DBCluster specifications reference images from the internal Artifactory registry rather than the upstream Google registry.</p>
+<table data-layout="default"><colgroup><col /><col /><col /></colgroup><tbody>
+<tr><th style="background-color: #1A73E8; color: #ffffff;"><p><strong>Integration</strong></p></th><th style="background-color: #1A73E8; color: #ffffff;"><p><strong>Technology</strong></p></th><th style="background-color: #1A73E8; color: #ffffff;"><p><strong>Scope</strong></p></th></tr>
+<tr><td style="background-color: #f1f8ff;"><p>Authentication</p></td><td style="background-color: #f1f8ff;"><p>Kerberos / Keytab</p></td><td style="background-color: #f1f8ff;"><p>Enterprise SSO for database client authentication</p></td></tr>
+<tr><td><p>Secrets Management</p></td><td><p>HashiCorp Vault (VPM Model)</p></td><td><p>All tenant namespaces reference DB Ops vault secrets</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>Backup Storage</p></td><td style="background-color: #f1f8ff;"><p>NetApp StorageGRID (S3)</p></td><td style="background-color: #f1f8ff;"><p>S3-compatible object storage for pgBackRest backups</p></td></tr>
+<tr><td><p>Log Aggregation</p></td><td><p>Splunk</p></td><td><p>Centralized log forwarding from database pods</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>APM / Monitoring</p></td><td style="background-color: #f1f8ff;"><p>Dynatrace</p></td><td style="background-color: #f1f8ff;"><p>Application performance monitoring (in progress with Google)</p></td></tr>
+<tr><td><p>Container Registry</p></td><td><p>JFrog Artifactory</p></td><td><p>Internal registry for all operator and database images</p></td></tr>
+</tbody></table>
+<hr />
+<h1>3. AlloyDB Omni Operator Architecture</h1>
+<h2>3.1 Cluster-Scoped Operator Model</h2>
+<p>The AlloyDB Omni Operator is deployed as a cluster-scoped operator. This means the operator’s controller deployments and associated webhook services run in a single, dedicated namespace (alloydb-omni-system), but the operator watches and manages Custom Resources (CRs) across all namespaces in the cluster. When a user creates a DBCluster resource in any tenant namespace, the operator’s reconciliation loop detects this resource and provisions all the necessary Kubernetes objects—StatefulSets, Services, PersistentVolumeClaims, Secrets, ConfigMaps—in that same tenant namespace.</p>
+<p>This cluster-scoped model provides several advantages. A single operator installation serves the entire OpenShift cluster, eliminating the need for per-namespace operator deployments. The operator’s ClusterRole and ClusterRoleBindings grant it the permissions necessary to manage resources across namespace boundaries. The webhook services (fleet-webhook-service and local-webhook-service) validate and mutate CRD resources regardless of which namespace they are created in.</p>
+<h2>3.2 Operator Namespace (alloydb-omni-system)</h2>
+<p>The alloydb-omni-system namespace is the operator’s control plane. It contains the following key resources:</p>
+<ul>
+<li><p><strong>Fleet Controller Deployment: </strong>The primary operator controller that watches for DBCluster and other CRD resources across all namespaces. It runs the global reconciliation logic that translates declarative CRD specifications into Kubernetes-native resources.</p></li>
+<li><p><strong>Local Controller Deployment: </strong>A companion controller that handles node-local operations, including direct interactions with database instances running on the same node. The version 1.6.0 release fixed a memory leak in this component.</p></li>
+<li><p><strong>Webhook Services: </strong>Admission webhooks (fleet-webhook-service and local-webhook-service) that intercept API server requests to validate and mutate AlloyDB Omni custom resources before they are persisted to etcd. These webhooks enforce schema validation, default values, and cross-resource consistency checks.</p></li>
+<li><p><strong>cert-manager Certificates: </strong>TLS certificates issued by cert-manager for securing webhook endpoints and internal operator communications. These include fleet-serving-cert and local-serving-cert, each with DNS names scoped to the alloydb-omni-system namespace.</p></li>
+<li><p><strong>ClusterIssuer: </strong>The alloydbomni-selfsigned-cluster-issuer ClusterIssuer resource provides a self-signed certificate authority used to bootstrap trust for the operator’s internal TLS infrastructure.</p></li>
+<li><p><strong>ServiceAccount &amp; RBAC: </strong>Dedicated ServiceAccounts with ClusterRole bindings that grant the operator permission to create, read, update, and delete resources across namespaces including Pods, Services, StatefulSets, PVCs, Secrets, ConfigMaps, and all AlloyDB Omni CRDs.</p></li>
+</ul>
+<h2>3.3 Tenant Namespace Model</h2>
+<p>Google recommends creating database clusters in namespaces separate from alloydb-omni-system. This separation improves isolation and security and prevents conflicts between the operator, the resources it manages, and user application components. Each tenant namespace contains the actual database workloads:</p>
+<ul>
+<li><p><strong>Database Pods: </strong>StatefulSet-managed pods running the AlloyDB Omni database engine along with sidecar containers for log rotation, memory management, and monitoring.</p></li>
+<li><p><strong>Kubernetes Services: </strong>ClusterIP or LoadBalancer services providing read-write (RW) and read-only (RO) endpoints for database connectivity.</p></li>
+<li><p><strong>PersistentVolumeClaims: </strong>Storage claims for database data directories, WAL logs, and observability data.</p></li>
+<li><p><strong>Secrets: </strong>Database admin passwords (sourced from Vault), TLS certificates, Kerberos keytabs, and backup storage credentials.</p></li>
+<li><p><strong>Custom Resources: </strong>DBCluster, BackupPlan, Backup, Restore, Failover, PgBouncer, Sidecar, and other CRDs that declare the desired state of the database infrastructure.</p></li>
+</ul>
+<hr />
+<h1>4. Operator Components &amp; Container Images</h1>
+<h2>4.1 Operator Controller Pods</h2>
+<p>The operator deploys two primary controller pods within the alloydb-omni-system namespace. These controllers implement the Kubernetes operator pattern: they run continuous reconciliation loops that compare the desired state declared in CRD resources against the actual state of Kubernetes objects and take corrective action to converge the two.</p>
+<p>The fleet controller is responsible for global lifecycle management—creating and scaling StatefulSets, managing Services, handling upgrades, and coordinating multi-instance HA topologies. The local controller handles node-level operations and direct database instance management, including health checks and local configuration updates.</p>
+<h2>4.2 Database Pod Containers</h2>
+<p>Each database pod provisioned by the operator runs multiple containers. The pod follows Kubernetes multi-container patterns with an init container for initialization and several sidecar containers for auxiliary functions.</p>
+<table data-layout="default"><colgroup><col /><col /><col /></colgroup><tbody>
+<tr><th style="background-color: #1A73E8; color: #ffffff;"><p><strong>Container</strong></p></th><th style="background-color: #1A73E8; color: #ffffff;"><p><strong>Role</strong></p></th><th style="background-color: #1A73E8; color: #ffffff;"><p><strong>Description</strong></p></th></tr>
+<tr><td style="background-color: #f1f8ff;"><p>database</p></td><td style="background-color: #f1f8ff;"><p>Primary</p></td><td style="background-color: #f1f8ff;"><p>The main AlloyDB Omni database engine container running PostgreSQL 17.5.0-compatible AlloyDB. Hosts the database server process, buffer pool, columnar engine, query processing, and storage layers.</p></td></tr>
+<tr><td><p>dbinit</p></td><td><p>Init Container</p></td><td><p>Runs once before the database container starts. Performs initial database cluster setup including running initdb, configuring pg_hba.conf, setting up data directories on persistent volumes, and preparing the environment for the database engine.</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>logrotate-agent</p></td><td style="background-color: #f1f8ff;"><p>Sidecar</p></td><td style="background-color: #f1f8ff;"><p>Manages rotation of PostgreSQL diagnostic logs including postgresql.log and postgresql.audit. Archives rotated logs to /obs/diagnostic/archive/ with configurable size-based (default 200 MB) and time-based rotation thresholds. Supports gzip compression with a default 7-day retention.</p></td></tr>
+<tr><td><p>memoryagent</p></td><td><p>Sidecar</p></td><td><p>Monitors and manages memory utilization within the database pod. Tracks memory consumption and provides the alloydb_omni_memory_used_byte metric. Helps prevent out-of-memory conditions.</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>alloydb-monitor</p></td><td style="background-color: #f1f8ff;"><p>Sidecar</p></td><td style="background-color: #f1f8ff;"><p>Collects and exposes database performance metrics in Prometheus format. Monitors database health, replication status, query performance, and resource utilization. Integrates with the operator’s health check framework for automated failover decisions.</p></td></tr>
+</tbody></table>
+<h2>4.3 Supporting Component Images</h2>
+<p>Beyond the core database pod, the operator manages additional component images for connection pooling and control plane functions. All images are sourced from the internal Artifactory registry after passing through the ATAAS-based Quarantine pipeline with Aqua Security scanning.</p>
+<table data-layout="default"><colgroup><col /><col /><col /></colgroup><tbody>
+<tr><th style="background-color: #1A73E8; color: #ffffff;"><p><strong>Image / Component</strong></p></th><th style="background-color: #1A73E8; color: #ffffff;"><p><strong>Purpose</strong></p></th><th style="background-color: #1A73E8; color: #ffffff;"><p><strong>Registry Source</strong></p></th></tr>
+<tr><td style="background-color: #f1f8ff;"><p>AlloyDB Omni Database (pg-service)</p></td><td style="background-color: #f1f8ff;"><p>Core database engine with AlloyDB enhancements</p></td><td style="background-color: #f1f8ff;"><p>Artifactory (quarantined from gcr.io)</p></td></tr>
+<tr><td><p>Operator Fleet Controller</p></td><td><p>Global reconciliation controller</p></td><td><p>Artifactory (quarantined from gcr.io)</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>Operator Local Controller</p></td><td style="background-color: #f1f8ff;"><p>Node-local database management</p></td><td style="background-color: #f1f8ff;"><p>Artifactory (quarantined from gcr.io)</p></td></tr>
+<tr><td><p>PgBouncer (1.23.x)</p></td><td><p>Connection pooling proxy deployed via PgBouncer CRD</p></td><td><p>Artifactory (quarantined from gcr.io)</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>Control Plane Agents</p></td><td style="background-color: #f1f8ff;"><p>Per-instance control plane managing HA, replication, and Patroni</p></td><td style="background-color: #f1f8ff;"><p>Artifactory (quarantined from gcr.io)</p></td></tr>
+<tr><td><p>kube-state-metrics</p></td><td><p>Exposes CRD metrics in Prometheus format (from operator 1.3.0+)</p></td><td><p>Artifactory (quarantined from registry.k8s.io)</p></td></tr>
+</tbody></table>
+<ac:structured-macro ac:name="note" ac:schema-version="1"><ac:rich-text-body><p>Starting with operator version 1.5.0, all AlloyDB Omni Kubernetes images are built upon Red Hat’s Universal Base Image (UBI) 9, ensuring compatibility with OpenShift’s security requirements and Red Hat’s container certification standards.</p></ac:rich-text-body></ac:structured-macro>
+<hr />
+<h1>5. Custom Resource Definitions (CRDs)</h1>
+<p>The AlloyDB Omni Operator extends the Kubernetes API by registering 25 Custom Resource Definitions across two API groups. These CRDs fall into two distinct categories: user-facing CRDs that platform teams and DBAs interact with directly, and internal CRDs that the operator creates and manages autonomously as part of its reconciliation logic. Users should never create or modify internal CRDs directly; they are implementation details of the operator’s control plane.</p>
+<h2>5.1 CRD Inventory &amp; Classification</h2>
+<table data-layout="default"><colgroup><col /><col /><col /><col /></colgroup><tbody>
+<tr><th style="background-color: #1A73E8; color: #ffffff;"><p><strong>#</strong></p></th><th style="background-color: #1A73E8; color: #ffffff;"><p><strong>CRD Name</strong></p></th><th style="background-color: #1A73E8; color: #ffffff;"><p><strong>API Group</strong></p></th><th style="background-color: #1A73E8; color: #ffffff;"><p><strong>Scope</strong></p></th></tr>
+<tr><td style="background-color: #f1f8ff;"><p>1</p></td><td style="background-color: #f1f8ff;"><p>backupplans</p></td><td style="background-color: #f1f8ff;"><p>alloydbomni.dbadmin.goog</p></td><td style="background-color: #f1f8ff;"><p>User-Facing</p></td></tr>
+<tr><td><p>2</p></td><td><p>backups</p></td><td><p>alloydbomni.dbadmin.goog</p></td><td><p>User-Facing</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>3</p></td><td style="background-color: #f1f8ff;"><p>dbclusters</p></td><td style="background-color: #f1f8ff;"><p>alloydbomni.dbadmin.goog</p></td><td style="background-color: #f1f8ff;"><p>User-Facing</p></td></tr>
+<tr><td><p>4</p></td><td><p>dbinstances</p></td><td><p>alloydbomni.dbadmin.goog</p></td><td><p>User-Facing</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>5</p></td><td style="background-color: #f1f8ff;"><p>failovers</p></td><td style="background-color: #f1f8ff;"><p>alloydbomni.dbadmin.goog</p></td><td style="background-color: #f1f8ff;"><p>User-Facing</p></td></tr>
+<tr><td><p>6</p></td><td><p>pgbouncers</p></td><td><p>alloydbomni.dbadmin.goog</p></td><td><p>User-Facing</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>7</p></td><td style="background-color: #f1f8ff;"><p>replications</p></td><td style="background-color: #f1f8ff;"><p>alloydbomni.dbadmin.goog</p></td><td style="background-color: #f1f8ff;"><p>User-Facing</p></td></tr>
+<tr><td><p>8</p></td><td><p>restores</p></td><td><p>alloydbomni.dbadmin.goog</p></td><td><p>User-Facing</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>9</p></td><td style="background-color: #f1f8ff;"><p>sidecars</p></td><td style="background-color: #f1f8ff;"><p>alloydbomni.dbadmin.goog</p></td><td style="background-color: #f1f8ff;"><p>User-Facing</p></td></tr>
+<tr><td><p>10</p></td><td><p>switchovers</p></td><td><p>alloydbomni.dbadmin.goog</p></td><td><p>User-Facing</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>11</p></td><td style="background-color: #f1f8ff;"><p>tdeconfigs</p></td><td style="background-color: #f1f8ff;"><p>alloydbomni.dbadmin.goog</p></td><td style="background-color: #f1f8ff;"><p>User-Facing</p></td></tr>
+<tr><td><p>12</p></td><td><p>userdefinedauthentications</p></td><td><p>alloydbomni.dbadmin.goog</p></td><td><p>User-Facing</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>13</p></td><td style="background-color: #f1f8ff;"><p>backuprepositories</p></td><td style="background-color: #f1f8ff;"><p>alloydbomni.internal.dbadmin.goog</p></td><td style="background-color: #f1f8ff;"><p>Internal</p></td></tr>
+<tr><td><p>14</p></td><td><p>createstandbyjobs</p></td><td><p>alloydbomni.internal.dbadmin.goog</p></td><td><p>Internal</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>15</p></td><td style="background-color: #f1f8ff;"><p>deletestandbyjobs</p></td><td style="background-color: #f1f8ff;"><p>alloydbomni.internal.dbadmin.goog</p></td><td style="background-color: #f1f8ff;"><p>Internal</p></td></tr>
+<tr><td><p>16</p></td><td><p>failovers</p></td><td><p>alloydbomni.internal.dbadmin.goog</p></td><td><p>Internal</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>17</p></td><td style="background-color: #f1f8ff;"><p>instancebackupplans</p></td><td style="background-color: #f1f8ff;"><p>alloydbomni.internal.dbadmin.goog</p></td><td style="background-color: #f1f8ff;"><p>Internal</p></td></tr>
+<tr><td><p>18</p></td><td><p>instancebackups</p></td><td><p>alloydbomni.internal.dbadmin.goog</p></td><td><p>Internal</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>19</p></td><td style="background-color: #f1f8ff;"><p>instancerestores</p></td><td style="background-color: #f1f8ff;"><p>alloydbomni.internal.dbadmin.goog</p></td><td style="background-color: #f1f8ff;"><p>Internal</p></td></tr>
+<tr><td><p>20</p></td><td><p>instances</p></td><td><p>alloydbomni.internal.dbadmin.goog</p></td><td><p>Internal</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>21</p></td><td style="background-color: #f1f8ff;"><p>instanceswitchovers</p></td><td style="background-color: #f1f8ff;"><p>alloydbomni.internal.dbadmin.goog</p></td><td style="background-color: #f1f8ff;"><p>Internal</p></td></tr>
+<tr><td><p>22</p></td><td><p>instanceuserdefinedauthentications</p></td><td><p>alloydbomni.internal.dbadmin.goog</p></td><td><p>Internal</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>23</p></td><td style="background-color: #f1f8ff;"><p>lrojobs</p></td><td style="background-color: #f1f8ff;"><p>alloydbomni.internal.dbadmin.goog</p></td><td style="background-color: #f1f8ff;"><p>Internal</p></td></tr>
+<tr><td><p>24</p></td><td><p>replicationconfigs</p></td><td><p>alloydbomni.internal.dbadmin.goog</p></td><td><p>Internal</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>25</p></td><td style="background-color: #f1f8ff;"><p>sidecars</p></td><td style="background-color: #f1f8ff;"><p>alloydbomni.internal.dbadmin.goog</p></td><td style="background-color: #f1f8ff;"><p>Internal</p></td></tr>
+</tbody></table>
+<p>The alloydbomni.dbadmin.goog group contains the user-facing contract—these are the CRDs documented by Google and intended for direct manipulation by cluster operators and DBAs. The alloydbomni.internal.dbadmin.goog group contains internal implementation resources created and managed solely by the operator’s controllers. Modifying internal CRDs directly may corrupt operator state and is unsupported.</p>
+<h2>5.2 User-Facing CRDs (alloydbomni.dbadmin.goog)</h2>
+<p>These 12 CRDs constitute the operator’s public API. Users create and manage these resources in tenant namespaces to declare the desired state of their database infrastructure.</p>
+<h3>dbclusters</h3>
+<p>The primary resource that declares an AlloyDB Omni database cluster. A DBCluster encapsulates the complete specification for a database instance including compute resources (CPU, memory), storage disks, database version (17.5.0), control plane agents version, HA configuration, admin user credentials, database parameters, scheduling constraints (node affinity, tolerations, pod anti-affinity), and feature flags (AlloyDB AI, memory agent). The operator watches DBCluster resources across all namespaces and provisions the corresponding StatefulSets, Services, PVCs, Secrets, and ConfigMaps in the tenant namespace.</p>
+<p>Key specification fields:</p>
+<ul>
+<li><p><strong>databaseVersion: </strong>Target database version string (e.g., "17.5.0").</p></li>
+<li><p><strong>controlPlaneAgentsVersion: </strong>Version of per-instance control plane agents.</p></li>
+<li><p><strong>primarySpec: </strong>Defines resources (CPU/memory), disks, adminUser.passwordRef, parameters (PostgreSQL GUCs), schedulingconfig (nodeaffinity, tolerations, podAntiAffinity), services (Logging, Monitoring), dbLoadBalancerOptions, and sidecarRef.</p></li>
+<li><p><strong>availability: </strong>HA settings: numberOfStandbys, enableAutoFailover, enableAutoHeal, autoFailoverTriggerThreshold, autoHealTriggerThreshold, healthcheckPeriodSeconds, enableStandbyAsReadReplica.</p></li>
+<li><p><strong>allowExternalIncomingTraffic: </strong>Boolean controlling external service exposure.</p></li>
+<li><p><strong>mode: </strong>Cluster mode for DR scenarios (primary/standby).</p></li>
+<li><p><strong>connectedModeSpec: </strong>Optional GCP project binding for connected-mode features.</p></li>
+</ul>
+<h3>dbinstances</h3>
+<p>Represents an individual database instance within a cluster. While DBCluster is the high-level declaration, DBInstance provides visibility into individual instance state. In an HA cluster with one primary and two standbys, there would be three DBInstance resources. This CRD gives administrators per-instance control and observability, including the ability to inspect instance-level health, role (primary/standby), and configuration.</p>
+<h3>backupplans</h3>
+<p>Defines the continuous backup configuration for a DBCluster. Specifies the backup storage location (local PV, GCS via gcsOptions, or S3-compatible via s3Options), cron-based backup schedules for full, incremental, and differential backups, a retention period in days, and a paused flag to suspend automatic backups. When no schedule is defined, the default is a daily full backup at midnight. In this environment, backups target NetApp StorageGRID via the s3Options field.</p>
+<h3>backups</h3>
+<p>Represents an individual backup, either scheduled by a BackupPlan or created manually. References a DBCluster and a BackupPlan. Manual backups set manual: true and can specify physicalBackupSpec.backupType as "full", "diff", or "incr". The status subresource tracks completion time, backup phase, and any critical incidents.</p>
+<h3>restores</h3>
+<p>Triggers restoration of a database cluster from a backup. Supports two modes: restoring from a named backup (backup field), or point-in-time recovery to a specific timestamp (pointInTime field) using continuous WAL archives. The clonedDBClusterConfig field enables restoring into a new DBCluster, allowing non-destructive recovery validation without affecting the source cluster.</p>
+<h3>failovers</h3>
+<p>Triggers an unplanned failover, promoting a standby instance to primary when the current primary has become unavailable. Created in the tenant namespace with a dbclusterRef pointing to the target cluster. The operator executes the promotion, reconfigures replication topology, and updates service endpoints. Failover metrics are exposed via kube-state-metrics with the alloydb_omni_failover_ prefix.</p>
+<h3>switchovers</h3>
+<p>Triggers a planned, controlled switchover between primary and standby instances. Unlike a failover (which handles unplanned outages), a switchover is used for planned maintenance such as node patching, storage migration, or load rebalancing. The switchover process demotes the current primary gracefully, ensures all WAL records are replicated, and promotes the target standby—resulting in zero data loss and minimal downtime.</p>
+<h3>pgbouncers</h3>
+<p>Deploys a PgBouncer connection pooling proxy for a DBCluster. Defines the target cluster via dbclusterRef, replica count, pool configuration parameters (pool_mode, default_pool_size, max_client_conn, max_db_connections, ignore_startup_parameters), pod resource requirements, container image override (must point to Artifactory), scheduling config (node affinity), and service type (ClusterIP or LoadBalancer).</p>
+<h3>replications</h3>
+<p>Configures cross-cluster or cross-region replication between a primary DBCluster and a secondary (standby) DBCluster. Used for disaster recovery setups where the primary cluster in one region asynchronously streams WAL records to a secondary cluster in a remote region or data center.</p>
+<h3>sidecars</h3>
+<p>Attaches custom sidecar containers to database pods. The sidecar specification defines one or more containers with their images, commands, arguments, resource limits, and volume mounts. Sidecars can mount the obsdisk volume to access database diagnostic logs at /obs/diagnostic/. Common use cases include Splunk log forwarding, custom monitoring agents, or enterprise backup tool integration. Registered to a DBCluster via primarySpec.sidecarRef.</p>
+<h3>tdeconfigs</h3>
+<p>Configures Transparent Data Encryption (TDE) for a database cluster. TDE encrypts data at rest at the storage layer, ensuring that the physical database files on disk are encrypted without requiring application-level changes. This CRD manages encryption key configuration and integration with key management systems for key rotation and lifecycle management.</p>
+<h3>userdefinedauthentications</h3>
+<p>Configures custom authentication mechanisms for the database cluster beyond the default pg_hba.conf settings. In this environment, this CRD is used to integrate Kerberos/GSSAPI authentication rules, enabling enterprise SSO through Active Directory and Kerberos keytab-based service principal authentication.</p>
+<h2>5.3 Internal Operator CRDs (alloydbomni.internal.dbadmin.goog)</h2>
+<p>These 13 CRDs are internal implementation details managed exclusively by the operator’s controllers. They decompose high-level user intent (expressed in user-facing CRDs) into granular, trackable operational units. Administrators may inspect these resources for troubleshooting but should never create, modify, or delete them directly.</p>
+<ac:structured-macro ac:name="warning" ac:schema-version="1"><ac:rich-text-body><p>Never create, modify, or delete internal CRDs directly. They are managed exclusively by the operator controllers. Tampering may corrupt operator state.</p></ac:rich-text-body></ac:structured-macro>
+<table data-layout="default"><colgroup><col /><col /><col /></colgroup><tbody>
+<tr><th style="background-color: #1A73E8; color: #ffffff;"><p><strong>Internal CRD</strong></p></th><th style="background-color: #1A73E8; color: #ffffff;"><p><strong>Created By</strong></p></th><th style="background-color: #1A73E8; color: #ffffff;"><p><strong>Purpose</strong></p></th></tr>
+<tr><td style="background-color: #f1f8ff;"><p>instances</p></td><td style="background-color: #f1f8ff;"><p>DBCluster controller</p></td><td style="background-color: #f1f8ff;"><p>Represents a single database instance (pod-level). Tracks instance role (primary/standby), health status, replication state, and configuration. Bridge between DBCluster and StatefulSet pod.</p></td></tr>
+<tr><td><p>createstandbyjobs</p></td><td><p>HA controller</p></td><td><p>Tracks the multi-step process of creating a new standby instance: base backup, WAL catch-up, replication slot creation, and synchronous replication setup.</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>deletestandbyjobs</p></td><td style="background-color: #f1f8ff;"><p>HA controller</p></td><td style="background-color: #f1f8ff;"><p>Tracks standby teardown: replication slot removal, streaming disconnection, and pod/PVC cleanup.</p></td></tr>
+<tr><td><p>failovers (internal)</p></td><td><p>Failover controller</p></td><td><p>Tracks failover execution steps: primary detection, standby selection, WAL replay, promotion, service endpoint update.</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>instancebackupplans</p></td><td style="background-color: #f1f8ff;"><p>Backup controller</p></td><td style="background-color: #f1f8ff;"><p>Per-instance decomposition of a user-facing BackupPlan. Manages backup schedule at the instance level.</p></td></tr>
+<tr><td><p>instancebackups</p></td><td><p>Backup controller</p></td><td><p>Per-instance backup execution tracking (pgBackRest invocation, WAL archiving, progress, errors).</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>instancerestores</p></td><td style="background-color: #f1f8ff;"><p>Restore controller</p></td><td style="background-color: #f1f8ff;"><p>Per-instance restore execution: backup retrieval, WAL replay to target timestamp, data directory swap.</p></td></tr>
+<tr><td><p>instanceswitchovers</p></td><td><p>Switchover controller</p></td><td><p>Per-instance switchover coordination: graceful demotion, replication consistency, promotion.</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>instanceuserdefinedauthentications</p></td><td style="background-color: #f1f8ff;"><p>Auth controller</p></td><td style="background-color: #f1f8ff;"><p>Per-instance application of Kerberos/GSSAPI authentication rules to pg_hba.conf.</p></td></tr>
+<tr><td><p>backuprepositories</p></td><td><p>Backup controller</p></td><td><p>Manages pgBackRest repository config: stanza creation, StorageGRID connectivity, initialization state.</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>replicationconfigs</p></td><td style="background-color: #f1f8ff;"><p>Replication controller</p></td><td style="background-color: #f1f8ff;"><p>Manages streaming replication configuration: primary host, sync/async mode, active connections.</p></td></tr>
+<tr><td><p>lrojobs</p></td><td><p>Operator controller</p></td><td><p>Long-Running Operation tracker for extended async operations (major upgrades, large restores). Provides timeout and retry logic.</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>sidecars (internal)</p></td><td style="background-color: #f1f8ff;"><p>Sidecar controller</p></td><td style="background-color: #f1f8ff;"><p>Per-instance sidecar container injection state tracking: readiness, volume mounts, reconciliation state.</p></td></tr>
+</tbody></table>
+<h2>5.4 CRD Relationship Map</h2>
+<p>The AlloyDB Omni CRDs form a hierarchical relationship model. A DBCluster (user-facing) is decomposed by the operator into one or more instances (internal), each representing a database pod. When HA is configured, the operator creates createstandbyjobs (internal) to provision standby instances. A BackupPlan (user-facing) is decomposed into instancebackupplans (internal), and each Backup (user-facing) spawns instancebackups (internal) for execution. The same pattern applies to Restores, Failovers, Switchovers, Sidecars, and UserDefinedAuthentications.</p>
+<p>This two-tier architecture (user-facing declaration + internal execution) allows the operator to present a simple, cluster-level API to users while managing the complex, instance-level orchestration internally. It also provides granular troubleshooting capability: if a backup appears stuck at the DBCluster level, administrators can inspect the corresponding instancebackups resources to identify which specific instance is failing and at which step.</p>
+<ac:structured-macro ac:name="code" ac:schema-version="1"><ac:parameter ac:name="language">bash</ac:parameter><ac:plain-text-body><![CDATA[# List all CRDs registered by the operator
+oc get crds | grep alloydbomni
+
+# Inspect internal instance resources for troubleshooting
+
+oc get instances.alloydbomni.internal.dbadmin.goog -n <tenant-namespace> -o yaml
+
+# Inspect standby creation job status
+
+oc get createstandbyjobs.alloydbomni.internal.dbadmin.goog -n <tenant-namespace> -o yaml]]></ac:plain-text-body></ac:structured-macro>
+
+<hr />
+<h1>6. Resource Lifecycle &amp; Reconciliation</h1>
+<p>The AlloyDB Omni Operator follows the standard Kubernetes operator pattern of continuous reconciliation. The operator’s controllers watch for changes to AlloyDB Omni CRDs and the Kubernetes resources they manage. When a discrepancy is detected between the desired state (as declared in the CRD spec) and the actual state (as observed in the cluster), the operator takes corrective action.</p>
+<h3>Provisioning Flow</h3>
+<p>When a user applies a DBCluster manifest to a tenant namespace, the operator executes the following sequence:</p>
+<ol>
+<li><p>The fleet webhook validates the DBCluster specification against schema constraints and cross-resource dependencies.</p></li>
+<li><p>The fleet controller detects the new DBCluster resource and begins reconciliation.</p></li>
+<li><p>PersistentVolumeClaims are created for the data disk, WAL disk, and observability disk based on the spec.</p></li>
+<li><p>A StatefulSet is created with the database pod template, including the database container, dbinit init container, and all sidecar containers (logrotate-agent, memoryagent, alloydb-monitor).</p></li>
+<li><p>Kubernetes Services are created: a read-write (RW) service pointing to the primary instance and a read-only (RO) service for replica traffic.</p></li>
+<li><p>The dbinit container runs initdb to initialize the PostgreSQL data directory on the persistent volume.</p></li>
+<li><p>The database container starts and the control plane agents configure the instance according to the DBCluster spec.</p></li>
+<li><p>The operator updates the DBCluster status to reflect DBClusterReady when all components are healthy.</p></li>
+</ol>
+<h3>Upgrade &amp; Update Flow</h3>
+<p>Database version upgrades and operator version updates follow controlled rolling update semantics. For minor version upgrades, the operator updates the database container image and triggers a controlled restart. For major version upgrades (e.g., 15.x to 17.x), the process may require manual pg_upgrade steps. When upgrading HA clusters, the operator may require temporarily disabling HA (setting numberOfStandbys to 0), performing the upgrade, and re-enabling HA afterward. Starting with operator 1.6.0, modifications to scheduling configuration are applied immediately and trigger a database restart.</p>
+<hr />
+<h1>7. Network Architecture &amp; Service Flows</h1>
+<h2>7.1 Internal Cluster Networking</h2>
+<p>All network communication within the AlloyDB Omni deployment occurs over the OpenShift cluster’s internal SDN (Software-Defined Network). The operator creates Kubernetes Services that provide stable DNS names and virtual IPs for database access.</p>
+<table data-layout="default"><colgroup><col /><col /><col /><col /></colgroup><tbody>
+<tr><th style="background-color: #1A73E8; color: #ffffff;"><p><strong>Source</strong></p></th><th style="background-color: #1A73E8; color: #ffffff;"><p><strong>Destination</strong></p></th><th style="background-color: #1A73E8; color: #ffffff;"><p><strong>Protocol / Port</strong></p></th><th style="background-color: #1A73E8; color: #ffffff;"><p><strong>Purpose</strong></p></th></tr>
+<tr><td style="background-color: #f1f8ff;"><p>Client Application</p></td><td style="background-color: #f1f8ff;"><p>RW Service (ClusterIP)</p></td><td style="background-color: #f1f8ff;"><p>TCP/5432</p></td><td style="background-color: #f1f8ff;"><p>Read-write database connections to primary</p></td></tr>
+<tr><td><p>Client Application</p></td><td><p>RO Service (ClusterIP)</p></td><td><p>TCP/5432</p></td><td><p>Read-only connections to standby replicas</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>Client Application</p></td><td style="background-color: #f1f8ff;"><p>PgBouncer Service</p></td><td style="background-color: #f1f8ff;"><p>TCP/5432</p></td><td style="background-color: #f1f8ff;"><p>Pooled connections via PgBouncer proxy</p></td></tr>
+<tr><td><p>PgBouncer Pod</p></td><td><p>RW / RO Service</p></td><td><p>TCP/5432</p></td><td><p>Proxied connections to database instances</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>Primary Pod</p></td><td style="background-color: #f1f8ff;"><p>Standby Pod(s)</p></td><td style="background-color: #f1f8ff;"><p>TCP/5432</p></td><td style="background-color: #f1f8ff;"><p>PostgreSQL streaming replication (WAL shipping)</p></td></tr>
+<tr><td><p>Standby Pod(s)</p></td><td><p>Primary Pod</p></td><td><p>TCP/5432</p></td><td><p>Replication slot management and WAL catch-up</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>Operator Controllers</p></td><td style="background-color: #f1f8ff;"><p>Kubernetes API Server</p></td><td style="background-color: #f1f8ff;"><p>TCP/6443</p></td><td style="background-color: #f1f8ff;"><p>Watch/list/create/update/delete resources</p></td></tr>
+<tr><td><p>Webhook Services</p></td><td><p>Kubernetes API Server</p></td><td><p>TCP/443 (TLS)</p></td><td><p>Admission webhook callbacks for CRD validation</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>alloydb-monitor</p></td><td style="background-color: #f1f8ff;"><p>Prometheus / Metrics Endpoint</p></td><td style="background-color: #f1f8ff;"><p>TCP/9187</p></td><td style="background-color: #f1f8ff;"><p>Prometheus metrics scraping</p></td></tr>
+<tr><td><p>Splunk Forwarder Sidecar</p></td><td><p>Splunk HEC / Indexer</p></td><td><p>TCP/8088 (TLS)</p></td><td><p>Log forwarding to enterprise Splunk</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>Vault Agent / VSO</p></td><td style="background-color: #f1f8ff;"><p>HashiCorp Vault</p></td><td style="background-color: #f1f8ff;"><p>TCP/8200 (TLS)</p></td><td style="background-color: #f1f8ff;"><p>Secret retrieval for DB credentials, keytabs</p></td></tr>
+<tr><td><p>Database Pod</p></td><td><p>Kerberos KDC</p></td><td><p>TCP+UDP/88</p></td><td><p>Kerberos authentication ticket exchange</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>Operator</p></td><td style="background-color: #f1f8ff;"><p>Artifactory Registry</p></td><td style="background-color: #f1f8ff;"><p>TCP/443 (TLS)</p></td><td style="background-color: #f1f8ff;"><p>Container image pulls (internal)</p></td></tr>
+<tr><td><p>Backup (pgBackRest)</p></td><td><p>StorageGRID S3</p></td><td><p>TCP/18082 (TLS)</p></td><td><p>Backup storage write/read operations</p></td></tr>
+</tbody></table>
+<h2>7.2 Kubernetes Services</h2>
+<p>The operator creates two primary services for each DBCluster in the tenant namespace:</p>
+<ul>
+<li><p><strong>Read-Write (RW) Service: </strong>Named as &lt;prefix&gt;-&lt;dbcluster&gt;-rw-ilb, this ClusterIP service routes traffic exclusively to the current primary database instance. It uses label selectors including dbs.internal.dbadmin.goog/ha-role=Primary to ensure traffic reaches only the active primary.</p></li>
+<li><p><strong>Read-Only (RO) Service: </strong>Named as &lt;prefix&gt;-&lt;dbcluster&gt;-ro-ilb, this service distributes read traffic across standby replicas when HA is configured with enableStandbyAsReadReplica set to true.</p></li>
+</ul>
+<p>Starting with operator 1.3.0, read-only and read-write load balancers are created concurrently during new cluster provisioning, reducing the time until the cluster is ready for connections.</p>
+<h2>7.3 PgBouncer Connection Pooling</h2>
+<p>When a PgBouncer CRD is applied, the operator creates a separate Deployment running PgBouncer pods. These pods connect to the database through the RW service and expose their own Service endpoint for client connections. PgBouncer supports multiple pool modes (session, transaction, statement) and provides a statistics interface accessible via the pgbouncer virtual database using the statsuser account.</p>
+<h2>7.4 TLS &amp; Certificate Management</h2>
+<p>The operator relies on cert-manager to issue and manage TLS certificates for internal communications. cert-manager is already available on the cluster, integrated with the enterprise Venafi solution for automated certificate provisioning and renewal. The operator creates the following cert-manager resources in the alloydb-omni-system namespace:</p>
+<ul>
+<li><p><strong>ClusterIssuer (alloydbomni-selfsigned-cluster-issuer): </strong>A cluster-wide self-signed certificate issuer used as the root of trust.</p></li>
+<li><p><strong>Namespace Issuers: </strong>fleet-selfsigned-issuer and local-selfsigned-issuer for webhook certificate issuance.</p></li>
+<li><p><strong>Certificates: </strong>fleet-serving-cert and local-serving-cert providing TLS for webhook HTTPS endpoints.</p></li>
+</ul>
+<p>Database client connections use TLS (TLSv1.3 with AES-256-GCM-SHA384) by default.</p>
+<hr />
+<h1>8. High Availability Architecture</h1>
+<h2>8.1 Patroni-Based HA</h2>
+<p>AlloyDB Omni implements high availability using Patroni, an open-source cluster management tool for PostgreSQL. Patroni automates the setup, monitoring, and failover of PostgreSQL clusters by coordinating instance roles through a distributed consensus system. In the Kubernetes deployment model, Patroni uses the Kubernetes API itself as its distributed configuration store (DCS), eliminating the need for an external etcd or ZooKeeper cluster.</p>
+<h2>8.2 Streaming Replication</h2>
+<p>AlloyDB Omni uses standard PostgreSQL streaming replication to maintain data consistency between primary and standby instances:</p>
+<ul>
+<li><p><strong>Synchronous Replication (default): </strong>Each transaction committed on the primary is synchronously replicated to standby instances before the commit is acknowledged to the client. This provides RPO of zero—no data loss during failover. The trade-off is increased transaction latency.</p></li>
+<li><p><strong>Asynchronous Replication: </strong>WAL records are sent to standbys asynchronously, reducing write latency but introducing potential data loss. Typically used for cross-region disaster recovery where network latency makes synchronous replication impractical.</p></li>
+</ul>
+<p>The primary maintains a replication slot for each standby instance. Replication status can be verified through pg_replication_slots and pg_stat_replication system views.</p>
+<h2>8.3 Automatic Failover</h2>
+<p>When HA is enabled through the DBCluster’s availability section, the operator configures automatic failover behavior through:</p>
+<ul>
+<li><p><strong>enableAutoFailover: </strong>Enables or disables automatic failover when the primary becomes unresponsive.</p></li>
+<li><p><strong>autoFailoverTriggerThreshold: </strong>The number of consecutive health check failures before failover is triggered (e.g., 3 failures).</p></li>
+<li><p><strong>healthcheckPeriodSeconds: </strong>The interval between health checks (default 30 seconds, range 1–86400).</p></li>
+<li><p><strong>enableAutoHeal: </strong>Enables automatic recovery of failed instances without operator intervention.</p></li>
+</ul>
+<p>When Patroni detects primary failure, the remaining standbys coordinate to select the most suitable replica for promotion. The selected standby replays outstanding WAL records, promotes itself, and updates Kubernetes service endpoints. This process typically achieves an RTO of less than sixty seconds.</p>
+<hr />
+<h1>9. Backup &amp; Disaster Recovery</h1>
+<p>AlloyDB Omni provides a comprehensive backup and recovery system managed entirely through Kubernetes CRDs. In this environment, all backups are stored on NetApp StorageGRID, an on-premises S3-compatible object storage platform.</p>
+<h3>Continuous Backup</h3>
+<p>When a BackupPlan resource is created for a DBCluster, the operator enables continuous backup. The system archives PostgreSQL Write-Ahead Log (WAL) files to the configured StorageGRID bucket, enabling point-in-time recovery (PITR) to any second within the retention window.</p>
+<h3>StorageGRID S3 Integration</h3>
+<p>In this disconnected environment, backup storage uses NetApp StorageGRID via the S3-compatible API. The BackupPlan CRD is configured with s3Options pointing to the internal StorageGRID endpoint:</p>
+<ul>
+<li><p><strong>S3 Credentials Secret: </strong>A Kubernetes Secret containing access-key-id and access-key fields, created in the tenant namespace. These credentials are provisioned through the DB Ops HashiCorp Vault and injected as Kubernetes Secrets via the Vault Secrets Operator.</p></li>
+<li><p><strong>StorageGRID Endpoint: </strong>The internal StorageGRID S3 API endpoint URL configured in s3Options.endpoint. The CA bundle must be provided via s3Options.caBundle or a certRef secret to establish trust with internal TLS certificates.</p></li>
+<li><p><strong>Bucket &amp; Key Path: </strong>Each DBCluster’s backups are isolated by bucket or key prefix path, ensuring multi-tenancy at the storage level.</p></li>
+</ul>
+<ac:structured-macro ac:name="code" ac:schema-version="1"><ac:parameter ac:name="language">bash</ac:parameter><ac:plain-text-body><![CDATA[apiVersion: alloydbomni.dbadmin.goog/v1
+kind: BackupPlan
+metadata:
+  name: backupplan-sample
+  namespace: <tenant-namespace>
+spec:
+  dbclusterRef: <dbcluster-name>
+  backupRetainDays: 14
+  backupSchedules:
+    full: "0 0 * * 0"          # Weekly full backup (Sunday midnight)
+    incremental: "0 21 * * *"   # Daily incremental (9 PM)
+  backupLocation:
+    type: S3
+    s3Options:
+      bucket: alloydb-backups
+      region: us-east-1
+      endpoint: https://storagegrid.internal.company.com:18082
+      key: <dbcluster-name>/backups
+      secretRef:
+        name: storagegrid-s3-credentials
+        namespace: <tenant-namespace>]]></ac:plain-text-body></ac:structured-macro>
+<h3>Point-in-Time Recovery</h3>
+<p>The Restore CRD supports PITR by specifying a pointInTime timestamp along with the sourceDBCluster. The operator uses the continuous WAL archive on StorageGRID to reconstruct the database state at the exact requested timestamp.</p>
+<h3>Cross-Region Disaster Recovery</h3>
+<p>For cross-region DR, AlloyDB Omni supports asynchronous streaming replication from a primary DBCluster in one region to a secondary DBCluster in a remote region. The secondary can be promoted via the Failover CRD. StorageGRID’s native cross-site replication can also ensure backup data availability across data centers independently of database replication.</p>
+<hr />
+<h1>10. Monitoring &amp; Observability</h1>
+<h3>Database-Level Metrics</h3>
+<p>The alloydb-monitor sidecar container exposes PostgreSQL and AlloyDB-specific metrics in Prometheus format:</p>
+<ul>
+<li><p><strong>alloydb_omni_memory_used_byte: </strong>Memory consumption of the database container in bytes.</p></li>
+<li><p><strong>alloydb_omni_instance_postgresql_wait_time_us_total: </strong>Total wait time across PostgreSQL wait event categories.</p></li>
+<li><p><strong>Standard PostgreSQL metrics: </strong>Connection counts, transaction rates, cache hit ratios, replication lag, WAL generation rates, lock statistics.</p></li>
+</ul>
+<h3>Custom Resource Metrics</h3>
+<p>Starting with operator version 1.3.0, the operator exposes custom resource metrics through kube-state-metrics:</p>
+<ul>
+<li><p><strong>DBCluster metrics (alloydb_omni_dbcluster_*): </strong>HA readiness, primary node readiness, database version, cluster phase, resource utilization.</p></li>
+<li><p><strong>Failover metrics (alloydb_omni_failover_*): </strong>Failover event counts, duration, and status.</p></li>
+<li><p><strong>PgBouncer metrics: </strong>Connection pool utilization, client and server connection counts, query routing statistics.</p></li>
+<li><p><strong>Backup/BackupPlan metrics: </strong>Backup completion status, timing, and storage utilization (new in operator 1.6.0).</p></li>
+</ul>
+<h3>Splunk Log Aggregation</h3>
+<p>Database diagnostic logs are forwarded to Splunk for centralized log management, search, and alerting. The following log streams are captured:</p>
+<ul>
+<li><p><strong>PostgreSQL Server Logs (postgresql.log): </strong>All database server activity including connection events, query errors, slow queries, checkpoint activity, and autovacuum operations.</p></li>
+<li><p><strong>Audit Logs (postgresql.audit): </strong>Session and object-level audit trails generated by the pgaudit extension. Captures DDL, DML on sensitive tables, and role/privilege changes.</p></li>
+<li><p><strong>Operator Controller Logs: </strong>Fleet and local controller logs from alloydb-omni-system, capturing reconciliation events, errors, and lifecycle operations.</p></li>
+</ul>
+<p>The logrotate-agent sidecar manages on-pod rotation with configurable thresholds, gzip compression, and 7-day local retention. The Splunk forwarder sidecar operates independently, streaming logs in real-time before rotation occurs.</p>
+<h3>Dynatrace Application Performance Monitoring</h3>
+<ac:structured-macro ac:name="note" ac:schema-version="1"><ac:rich-text-body><p>Dynatrace integration for AlloyDB Omni is currently being developed in collaboration with Google. The specifics (sidecar injection method, metric mapping, dashboard templates) are subject to the outcome of the ongoing engagement and will be updated in a future revision.</p></ac:rich-text-body></ac:structured-macro>
+<p>The target architecture involves deploying the Dynatrace OneAgent as a sidecar or leveraging the Dynatrace Operator’s code injection for infrastructure monitoring (CPU, memory, disk I/O), database performance analysis (query-level, connection pools, lock contention), and end-to-end distributed tracing.</p>
+<hr />
+<h1>11. OpenShift-Specific Considerations</h1>
+<h2>11.1 Helm Chart Installation</h2>
+<p>In this environment, the AlloyDB Omni Operator is installed using the Helm chart version 1.6.0 rather than OLM. Bank-compliant custom Helm charts are provided directly by the Google vendor team, tailored for the organization’s disconnected OpenShift environment. These charts are ingested through the ATAAS-based Quarantine pipeline, scanned with Aqua, and published to the internal Artifactory Helm repository.</p>
+<ol>
+<li><p>Receive the bank-compliant custom Helm chart tarball (alloydbomni-operator-1.6.0.tgz) from the Google vendor team and ingest it through the ATAAS-based Quarantine pipeline into the internal Artifactory Helm repository.</p></li>
+<li><p>cert-manager is already deployed on the cluster and integrated with the bank’s enterprise Venafi solution. No separate cert-manager installation is required.</p></li>
+<li><p>Create the alloydb-omni-system namespace and apply the AlloyDB Omni-specific cert-manager resources (ClusterIssuer, namespace Issuers, Certificates for fleet and local webhook services) that integrate with the existing Venafi-backed cert-manager deployment.</p></li>
+<li><p>Configure Helm values to override all image references from gcr.io/alloydb-omni/* to the internal Artifactory registry paths.</p></li>
+<li><p>Run helm install with the modified values file targeting the alloydb-omni-system namespace.</p></li>
+<li><p>Verify operator pods (fleet controller, local controller) reach Running state and webhook endpoints are responsive.</p></li>
+</ol>
+<ac:structured-macro ac:name="code" ac:schema-version="1"><ac:parameter ac:name="language">bash</ac:parameter><ac:plain-text-body><![CDATA[helm install alloydb-omni-operator ./alloydbomni-operator-1.6.0.tgz \
+  --namespace alloydb-omni-system \
+  --create-namespace \
+  -f values-disconnected.yaml]]></ac:plain-text-body></ac:structured-macro>
+<p>The values-disconnected.yaml file overrides all image repositories, image tags, and pull secrets to reference the internal Artifactory registry and the ImagePullSecret configured for Artifactory authentication.</p>
+<h2>11.2 Disconnected Environment &amp; Image Pipeline</h2>
+<p>This OpenShift cluster operates in a fully air-gapped environment. All container images must be pre-staged in the internal Artifactory container registry before deployment.</p>
+<h3>Quarantine Pipeline</h3>
+<ol>
+<li><p>Image Request: The platform team identifies required images and versions from the bank-compliant Helm chart provided by the Google vendor team.</p></li>
+<li><p>ATAAS Quarantine Pull: An ATAAS (Automation-Testing-as-a-Service) based quarantine job running in a controlled DMZ pulls images from gcr.io/alloydb-omni/ through an approved egress proxy.</p></li>
+<li><p>Aqua Security Scanning: Images undergo Aqua container security scanning including CVE analysis, malware detection, compliance validation against CIS benchmarks, and license risk assessment.</p></li>
+<li><p>Approval &amp; Promotion: Images that pass all Aqua scanning gates are promoted from the ATAAS quarantine staging area to the production Artifactory container registry.</p></li>
+<li><p>Registry Path Mapping: Images are published under an internal path (e.g., artifactory.internal.company.com/alloydb-omni/) mirroring upstream structure.</p></li>
+</ol>
+<h3>Required Images</h3>
+<table data-layout="default"><colgroup><col /><col /><col /></colgroup><tbody>
+<tr><th style="background-color: #1A73E8; color: #ffffff;"><p><strong>Image</strong></p></th><th style="background-color: #1A73E8; color: #ffffff;"><p><strong>Component</strong></p></th><th style="background-color: #1A73E8; color: #ffffff;"><p><strong>Versioned By</strong></p></th></tr>
+<tr><td style="background-color: #f1f8ff;"><p>Fleet controller</p></td><td style="background-color: #f1f8ff;"><p>Operator control plane</p></td><td style="background-color: #f1f8ff;"><p>Helm chart version (1.6.0)</p></td></tr>
+<tr><td><p>Local controller</p></td><td><p>Operator node agent</p></td><td><p>Helm chart version (1.6.0)</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>AlloyDB Omni database (pg-service)</p></td><td style="background-color: #f1f8ff;"><p>Database engine</p></td><td style="background-color: #f1f8ff;"><p>databaseVersion (17.5.0)</p></td></tr>
+<tr><td><p>Control plane agents</p></td><td><p>Per-instance management</p></td><td><p>controlPlaneAgentsVersion</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>dbinit</p></td><td style="background-color: #f1f8ff;"><p>Init container</p></td><td style="background-color: #f1f8ff;"><p>Database version</p></td></tr>
+<tr><td><p>logrotate-agent</p></td><td><p>Log rotation sidecar</p></td><td><p>Operator version</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>memoryagent</p></td><td style="background-color: #f1f8ff;"><p>Memory monitoring sidecar</p></td><td style="background-color: #f1f8ff;"><p>Operator version</p></td></tr>
+<tr><td><p>alloydb-monitor</p></td><td><p>Metrics exporter sidecar</p></td><td><p>Operator version</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>PgBouncer</p></td><td style="background-color: #f1f8ff;"><p>Connection pooler</p></td><td style="background-color: #f1f8ff;"><p>PgBouncer CRD image field (1.23.x)</p></td></tr>
+<tr><td><p>kube-state-metrics</p></td><td><p>CRD metrics exporter</p></td><td><p>Operator dependency</p></td></tr>
+</tbody></table>
+<p>All DBCluster manifests must reference the Artifactory registry path in any image override fields. For PgBouncer, the image is specified directly in the PgBouncer CRD’s podSpec.image field and must also point to Artifactory.</p>
+<h3>ImagePullSecrets</h3>
+<p>Each namespace (alloydb-omni-system and all tenant namespaces) must have an ImagePullSecret configured for Artifactory authentication. This secret is typically created by namespace provisioning automation and linked to the default ServiceAccount, or specified explicitly in the Helm values and DBCluster manifests.</p>
+<h2>11.3 Security Context Constraints (SCC)</h2>
+<p>OpenShift enforces SCCs that control the security profile under which pods run. Starting with operator version 1.5.0, the operator recognizes the openshift.io/scc=anyuid annotation on DBCluster resources:</p>
+<ac:structured-macro ac:name="code" ac:schema-version="1"><ac:parameter ac:name="language">bash</ac:parameter><ac:plain-text-body><![CDATA[oc annotate dbclusters.alloydbomni.dbadmin.goog <name> -n <namespace> openshift.io/scc=anyuid]]></ac:plain-text-body></ac:structured-macro>
+<p>When installing via Helm (rather than OLM), administrators must explicitly bind the operator’s ServiceAccount to the appropriate SCC (typically anyuid or a custom SCC) through a ClusterRoleBinding, as Helm does not automatically negotiate SCC bindings.</p>
+<h2>11.4 UBI-Based Images</h2>
+<p>Starting with operator version 1.5.0, all AlloyDB Omni Kubernetes images are built upon Red Hat’s Universal Base Image (UBI) 9. UBI 9 ensures compatibility with OpenShift’s CRI-O runtime, RHEL CoreOS nodes, and the ATAAS Quarantine pipeline with Aqua Security scanning. UBI-based images pass Red Hat’s container certification requirements and are compatible with cgroup v2 and Linux kernel 4.18+.</p>
+<hr />
+<h1>12. Operational Workflows</h1>
+<p>This section provides comprehensive operational procedures for day-to-day management, troubleshooting, and lifecycle operations of AlloyDB Omni on OpenShift. All commands use the <code>oc</code> CLI consistent with the OpenShift environment.</p>
+
+<h2>12.1 Cluster Health &amp; Status Verification</h2>
+
+<h3>Check DBCluster Status</h3>
+<ac:structured-macro ac:name="code" ac:schema-version="1"><ac:parameter ac:name="language">bash</ac:parameter><ac:plain-text-body><![CDATA[# List all DBClusters across all tenant namespaces
+oc get dbclusters.alloydbomni.dbadmin.goog --all-namespaces
+
+# Detailed status for a specific cluster
+
+oc get dbclusters.alloydbomni.dbadmin.goog <dbcluster-name> -n <namespace> -o yaml
+
+# Quick phase check (expect: DBClusterReady)
+
+oc get dbclusters.alloydbomni.dbadmin.goog <dbcluster-name> -n <namespace>   -o jsonpath=’{.status.phase}’]]></ac:plain-text-body></ac:structured-macro>
+
+<h3>Check Database &amp; Operator Versions</h3>
+<ac:structured-macro ac:name="code" ac:schema-version="1"><ac:parameter ac:name="language">bash</ac:parameter><ac:plain-text-body><![CDATA[# Current database version running on the cluster
+oc get dbclusters.alloydbomni.dbadmin.goog <dbcluster-name> -n <namespace>   -o jsonpath='{.status.primary.currentDatabaseVersion}'
+
+# Current control plane agents (operator) version
+
+oc get dbclusters.alloydbomni.dbadmin.goog <dbcluster-name> -n <namespace>   -o jsonpath=’{.status.primary.currentControlPlaneAgentsVersion}’
+
+# Spec vs running version comparison
+
+oc get dbclusters.alloydbomni.dbadmin.goog <dbcluster-name> -n <namespace>   -o jsonpath=‘Spec: {.spec.databaseVersion} | Running: {.status.primary.currentDatabaseVersion}’]]></ac:plain-text-body></ac:structured-macro>
+
+<h3>Check Operator Controller Pods</h3>
+<ac:structured-macro ac:name="code" ac:schema-version="1"><ac:parameter ac:name="language">bash</ac:parameter><ac:plain-text-body><![CDATA[# Verify operator pods are running in the control plane namespace
+oc get pods -n alloydb-omni-system
+
+# Check operator controller logs for errors
+
+oc logs -n alloydb-omni-system deployment/fleet-controller –tail=100
+oc logs -n alloydb-omni-system deployment/local-controller –tail=100
+
+# Check webhook service endpoints
+
+oc get endpoints fleet-webhook-service -n alloydb-omni-system
+oc get endpoints local-webhook-service -n alloydb-omni-system]]></ac:plain-text-body></ac:structured-macro>
+
+<h3>List Database Pods &amp; Container Status</h3>
+<ac:structured-macro ac:name="code" ac:schema-version="1"><ac:parameter ac:name="language">bash</ac:parameter><ac:plain-text-body><![CDATA[# List all pods for a specific DBCluster
+oc get pods -l alloydbomni.internal.dbadmin.goog/dbcluster=<dbcluster-name> -n <namespace>
+
+# Verify all containers are running (expect 3/3: database, logrotate-agent, memoryagent)
+
+oc get pods -l alloydbomni.internal.dbadmin.goog/dbcluster=<dbcluster-name>   -n <namespace> -o wide
+
+# Describe a pod for detailed container status including init containers (dbinit)
+
+oc describe pod <pod-name> -n <namespace>
+
+# Check container images currently running (verify Artifactory paths)
+
+oc get pod <pod-name> -n <namespace>   -o jsonpath=’{range .spec.containers[*]}{.name}: {.image}{”
+“}{end}’]]></ac:plain-text-body></ac:structured-macro>
+
+<h2>12.2 Database Connectivity</h2>
+
+<h3>Connect to the Database via Pod Exec</h3>
+<ac:structured-macro ac:name="code" ac:schema-version="1"><ac:parameter ac:name="language">bash</ac:parameter><ac:plain-text-body><![CDATA[# Exec into the database container
+oc exec -ti <pod-name> -c database -n <namespace> -- /bin/bash
+
+# Connect to PostgreSQL as admin
+
+psql -h localhost -U postgres
+
+# Connect to a specific database
+
+psql -h localhost -U postgres -d <database-name>
+
+# Quick one-liner: run a query without interactive shell
+
+oc exec -ti <pod-name> -c database -n <namespace> –   psql -h localhost -U postgres -c “SELECT version();”]]></ac:plain-text-body></ac:structured-macro>
+
+<h3>Connect via Kubernetes Service</h3>
+<ac:structured-macro ac:name="code" ac:schema-version="1"><ac:parameter ac:name="language">bash</ac:parameter><ac:plain-text-body><![CDATA[# Get the RW and RO service endpoints
+oc get svc -l alloydbomni.internal.dbadmin.goog/dbcluster=<dbcluster-name> -n <namespace>
+
+# Port-forward for local client access (useful for debugging)
+
+oc port-forward svc/<rw-service-name> 5432:5432 -n <namespace>
+
+# Then connect from local machine
+
+PGPASSWORD=”<password>” PGSSLMODE=“require” psql -h 127.0.0.1 -p 5432 -U postgres]]></ac:plain-text-body></ac:structured-macro>
+
+<h3>Verify Kerberos Authentication</h3>
+<ac:structured-macro ac:name="code" ac:schema-version="1"><ac:parameter ac:name="language">bash</ac:parameter><ac:plain-text-body><![CDATA[# Verify keytab is mounted in database pod
+oc exec -ti <pod-name> -c database -n <namespace> -- ls -la /etc/krb5/
+
+# Check pg_hba.conf for GSSAPI entries
+
+oc exec -ti <pod-name> -c database -n <namespace> –   cat /mnt/disks/pgsql/data/pg_hba.conf | grep -i gss
+
+# Test Kerberos authentication from a client pod
+
+kinit <principal>@<REALM>
+psql -h <rw-service> -U <kerberos-user> -d postgres]]></ac:plain-text-body></ac:structured-macro>
+
+<h2>12.3 High Availability Operations</h2>
+
+<h3>Check HA Status &amp; Replication</h3>
+<ac:structured-macro ac:name="code" ac:schema-version="1"><ac:parameter ac:name="language">bash</ac:parameter><ac:plain-text-body><![CDATA[# Check HA configuration
+oc get dbclusters.alloydbomni.dbadmin.goog <dbcluster-name> -n <namespace>   -o jsonpath='{.spec.availability}'
+
+# Identify primary and standby roles
+
+oc get pods -l alloydbomni.internal.dbadmin.goog/dbcluster=<dbcluster-name>   -l dbs.internal.dbadmin.goog/ha-role -n <namespace> –show-labels
+
+# Verify streaming replication from inside the primary pod
+
+oc exec -ti <primary-pod> -c database -n <namespace> –   psql -h localhost -U postgres -c “SELECT * FROM pg_stat_replication;”
+
+# Check replication slots
+
+oc exec -ti <primary-pod> -c database -n <namespace> –   psql -h localhost -U postgres -c “SELECT slot_name, active, restart_lsn FROM pg_replication_slots;”
+
+# Check replication lag (on standby)
+
+oc exec -ti <standby-pod> -c database -n <namespace> –   psql -h localhost -U postgres -c “SELECT now() - pg_last_xact_replay_timestamp() AS replication_lag;”]]></ac:plain-text-body></ac:structured-macro>
+
+<h3>Perform a Manual Failover (Unplanned)</h3>
+<ac:structured-macro ac:name="code" ac:schema-version="1"><ac:parameter ac:name="language">bash</ac:parameter><ac:plain-text-body><![CDATA[cat <<EOF | oc apply -f -
+apiVersion: alloydbomni.dbadmin.goog/v1
+kind: Failover
+metadata:
+  name: failover-$(date +%Y%m%d%H%M%S)
+  namespace: <tenant-namespace>
+spec:
+  dbclusterRef: <dbcluster-name>
+EOF
+
+# Monitor failover progress
+
+oc get failovers.alloydbomni.dbadmin.goog -n <namespace> -w
+
+# Check internal failover job status
+
+oc get failovers.alloydbomni.internal.dbadmin.goog -n <namespace> -o yaml]]></ac:plain-text-body></ac:structured-macro>
+
+<h3>Perform a Planned Switchover</h3>
+<ac:structured-macro ac:name="code" ac:schema-version="1"><ac:parameter ac:name="language">bash</ac:parameter><ac:plain-text-body><![CDATA[cat <<EOF | oc apply -f -
+apiVersion: alloydbomni.dbadmin.goog/v1
+kind: Switchover
+metadata:
+  name: switchover-$(date +%Y%m%d%H%M%S)
+  namespace: <tenant-namespace>
+spec:
+  dbclusterRef: <dbcluster-name>
+EOF
+
+# Monitor switchover progress
+
+oc get switchovers.alloydbomni.dbadmin.goog -n <namespace> -w]]></ac:plain-text-body></ac:structured-macro>
+
+<h3>Scale Standbys Up / Down</h3>
+<ac:structured-macro ac:name="code" ac:schema-version="1"><ac:parameter ac:name="language">bash</ac:parameter><ac:plain-text-body><![CDATA[# Scale up: increase numberOfStandbys
+oc patch dbclusters.alloydbomni.dbadmin.goog <dbcluster-name> -n <namespace>   --type=merge -p '{"spec":{"availability":{"numberOfStandbys":2}}}'
+
+# Scale down: decrease numberOfStandbys
+
+oc patch dbclusters.alloydbomni.dbadmin.goog <dbcluster-name> -n <namespace>   –type=merge -p ‘{“spec”:{“availability”:{“numberOfStandbys”:1}}}’
+
+# Monitor standby creation/deletion jobs
+
+oc get createstandbyjobs.alloydbomni.internal.dbadmin.goog -n <namespace>
+oc get deletestandbyjobs.alloydbomni.internal.dbadmin.goog -n <namespace>]]></ac:plain-text-body></ac:structured-macro>
+
+<h2>12.4 Backup &amp; Restore Operations</h2>
+
+<h3>Check Backup Status</h3>
+<ac:structured-macro ac:name="code" ac:schema-version="1"><ac:parameter ac:name="language">bash</ac:parameter><ac:plain-text-body><![CDATA[# List all backups for a namespace
+oc get backups.alloydbomni.dbadmin.goog -n <namespace>
+
+# List backup plans
+
+oc get backupplans.alloydbomni.dbadmin.goog -n <namespace>
+
+# Check backup plan schedule and retention
+
+oc get backupplans.alloydbomni.dbadmin.goog <plan-name> -n <namespace> -o yaml
+
+# Check internal backup repository status (StorageGRID connectivity)
+
+oc get backuprepositories.alloydbomni.internal.dbadmin.goog -n <namespace> -o yaml
+
+# Check instance-level backup status for troubleshooting
+
+oc get instancebackups.alloydbomni.internal.dbadmin.goog -n <namespace>]]></ac:plain-text-body></ac:structured-macro>
+
+<h3>Create a Manual Backup</h3>
+<ac:structured-macro ac:name="code" ac:schema-version="1"><ac:parameter ac:name="language">bash</ac:parameter><ac:plain-text-body><![CDATA[cat <<EOF | oc apply -f -
+apiVersion: alloydbomni.dbadmin.goog/v1
+kind: Backup
+metadata:
+  name: manual-backup-$(date +%Y%m%d%H%M%S)
+  namespace: <tenant-namespace>
+spec:
+  dbclusterRef: <dbcluster-name>
+  backupPlanRef: <backupplan-name>
+  manual: true
+  physicalBackupSpec:
+    backupType: full    # Options: full, diff, incr
+EOF
+
+# Monitor backup progress
+
+oc get backups.alloydbomni.dbadmin.goog -n <namespace> -w]]></ac:plain-text-body></ac:structured-macro>
+
+<h3>Pause / Resume Scheduled Backups</h3>
+<ac:structured-macro ac:name="code" ac:schema-version="1"><ac:parameter ac:name="language">bash</ac:parameter><ac:plain-text-body><![CDATA[# Pause scheduled backups
+oc patch backupplans.alloydbomni.dbadmin.goog <plan-name> -n <namespace>   --type=merge -p '{"spec":{"paused":true}}'
+
+# Resume scheduled backups
+
+oc patch backupplans.alloydbomni.dbadmin.goog <plan-name> -n <namespace>   –type=merge -p ‘{“spec”:{“paused”:false}}’]]></ac:plain-text-body></ac:structured-macro>
+
+<h3>Restore from Backup</h3>
+<ac:structured-macro ac:name="code" ac:schema-version="1"><ac:parameter ac:name="language">bash</ac:parameter><ac:plain-text-body><![CDATA[# Restore from a named backup into a new cluster (non-destructive)
+cat <<EOF | oc apply -f -
+apiVersion: alloydbomni.dbadmin.goog/v1
+kind: Restore
+metadata:
+  name: restore-$(date +%Y%m%d%H%M%S)
+  namespace: <tenant-namespace>
+spec:
+  sourceDBCluster: <original-dbcluster-name>
+  backup: <backup-name>
+  clonedDBClusterConfig:
+    dbclusterName: <new-dbcluster-name>
+EOF
+
+# Point-in-time recovery
+
+cat <<EOF | oc apply -f -
+apiVersion: alloydbomni.dbadmin.goog/v1
+kind: Restore
+metadata:
+name: pitr-$(date +%Y%m%d%H%M%S)
+namespace: <tenant-namespace>
+spec:
+sourceDBCluster: <original-dbcluster-name>
+pointInTime: “2026-03-30T14:30:00Z”
+clonedDBClusterConfig:
+dbclusterName: <recovered-dbcluster-name>
+EOF
+
+# Monitor restore progress
+
+oc get restores.alloydbomni.dbadmin.goog -n <namespace> -w
+oc get dbclusters.alloydbomni.dbadmin.goog -n <namespace> -w]]></ac:plain-text-body></ac:structured-macro>
+
+<h2>12.5 PgBouncer Operations</h2>
+
+<ac:structured-macro ac:name=“code” ac:schema-version=“1”><ac:parameter ac:name=“language”>bash</ac:parameter><ac:plain-text-body><![CDATA[# Check PgBouncer status
+oc get pgbouncers.alloydbomni.dbadmin.goog -n <namespace>
+
+# Check PgBouncer pods
+
+oc get pods -l app=pgbouncer -n <namespace>
+
+# View PgBouncer pool statistics
+
+oc exec -ti <pgbouncer-pod> -n <namespace> –   psql -h 127.0.0.1 -p 5432 -U statsuser -d pgbouncer -c “SHOW POOLS;”
+
+# View PgBouncer client statistics
+
+oc exec -ti <pgbouncer-pod> -n <namespace> –   psql -h 127.0.0.1 -p 5432 -U statsuser -d pgbouncer -c “SHOW STATS;”
+
+# Scale PgBouncer replicas
+
+oc patch pgbouncers.alloydbomni.dbadmin.goog <pgbouncer-name> -n <namespace>   –type=merge -p ‘{“spec”:{“replicaCount”:3}}’]]></ac:plain-text-body></ac:structured-macro>
+
+<h2>12.6 Log &amp; Diagnostic Operations</h2>
+
+<ac:structured-macro ac:name=“code” ac:schema-version=“1”><ac:parameter ac:name=“language”>bash</ac:parameter><ac:plain-text-body><![CDATA[# View live PostgreSQL server logs
+oc exec -ti <pod-name> -c database -n <namespace> –   tail -f /obs/diagnostic/postgresql.log
+
+# View audit logs (requires pgaudit enabled)
+
+oc exec -ti <pod-name> -c database -n <namespace> –   tail -f /obs/diagnostic/postgresql.audit
+
+# Check the current audit log file path
+
+oc exec -ti <pod-name> -c database -n <namespace> –   psql -h localhost -U postgres -c “SELECT alloydb_audit_current_logfile();”
+
+# List archived/rotated logs
+
+oc exec -ti <pod-name> -c database -n <namespace> –   ls -lah /obs/diagnostic/archive/
+
+# Check logrotate-agent sidecar logs
+
+oc logs <pod-name> -c logrotate-agent -n <namespace> –tail=50
+
+# Check memoryagent sidecar logs
+
+oc logs <pod-name> -c memoryagent -n <namespace> –tail=50
+
+# Check alloydb-monitor metrics exporter logs
+
+oc logs <pod-name> -c alloydb-monitor -n <namespace> –tail=50]]></ac:plain-text-body></ac:structured-macro>
+
+<h2>12.7 Vault &amp; Secrets Operations</h2>
+
+<ac:structured-macro ac:name=“code” ac:schema-version=“1”><ac:parameter ac:name=“language”>bash</ac:parameter><ac:plain-text-body><![CDATA[# Verify Vault-synced secrets exist in tenant namespace
+oc get secrets -n <namespace> | grep -E “(db-pw|storagegrid|keytab|tls)”
+
+# Check Vault Secrets Operator sync status
+
+oc get vaultstaticsecrets -n <namespace>
+
+# Verify admin password secret referenced by DBCluster
+
+oc get secret <password-secret-name> -n <namespace> -o jsonpath=’{.data}’ | base64 -d
+
+# Verify StorageGRID S3 credentials secret
+
+oc get secret storagegrid-s3-credentials -n <namespace>   -o jsonpath=’{.data.access-key-id}’ | base64 -d
+
+# Verify Kerberos keytab secret is mounted
+
+oc exec -ti <pod-name> -c database -n <namespace> –   klist -kt /etc/krb5/postgres.keytab]]></ac:plain-text-body></ac:structured-macro>
+
+<h2>12.8 CRD Inspection &amp; Troubleshooting</h2>
+
+<h3>Inspect All CRDs</h3>
+<ac:structured-macro ac:name="code" ac:schema-version="1"><ac:parameter ac:name="language">bash</ac:parameter><ac:plain-text-body><![CDATA[# List all AlloyDB Omni CRDs in the cluster
+oc get crds | grep alloydbomni
+
+# List all user-facing resources in a namespace
+
+oc get dbclusters,dbinstances,backupplans,backups,restores,failovers,switchovers,pgbouncers,sidecars,replications,tdeconfigs,userdefinedauthentications -n <namespace>
+
+# List all internal resources in a namespace
+
+oc get instances.alloydbomni.internal.dbadmin.goog,createstandbyjobs.alloydbomni.internal.dbadmin.goog,backuprepositories.alloydbomni.internal.dbadmin.goog,replicationconfigs.alloydbomni.internal.dbadmin.goog -n <namespace>]]></ac:plain-text-body></ac:structured-macro>
+
+<h3>Troubleshoot Stuck DBCluster</h3>
+<ac:structured-macro ac:name="code" ac:schema-version="1"><ac:parameter ac:name="language">bash</ac:parameter><ac:plain-text-body><![CDATA[# Check DBCluster conditions and critical incidents
+oc get dbclusters.alloydbomni.dbadmin.goog <name> -n <namespace>   -o jsonpath='{.status.conditions}' | python3 -m json.tool
+
+# Check internal Instance resource state
+
+oc get instances.alloydbomni.internal.dbadmin.goog -n <namespace> -o yaml
+
+# Check events for the namespace
+
+oc get events -n <namespace> –sort-by=’.lastTimestamp’ | grep -i alloydb
+
+# Check if PVCs are bound
+
+oc get pvc -l alloydbomni.internal.dbadmin.goog/dbcluster=<name> -n <namespace>
+
+# Check pod scheduling issues
+
+oc describe pod <pod-name> -n <namespace> | grep -A 10 “Events:”]]></ac:plain-text-body></ac:structured-macro>
+
+<h3>Troubleshoot HA / Standby Issues</h3>
+<ac:structured-macro ac:name="code" ac:schema-version="1"><ac:parameter ac:name="language">bash</ac:parameter><ac:plain-text-body><![CDATA[# Check standby creation job status and step
+oc get createstandbyjobs.alloydbomni.internal.dbadmin.goog -n <namespace> -o yaml
+
+# Look for retryError and currentStep fields
+
+oc get createstandbyjobs.alloydbomni.internal.dbadmin.goog -n <namespace>   -o jsonpath=’{range .items[*]}{.metadata.name}: Step={.spec.currentStep} Error={.spec.retryError}{”
+“}{end}’
+
+# Check replication config state
+
+oc get replicationconfigs.alloydbomni.internal.dbadmin.goog -n <namespace> -o yaml
+
+# Verify replication profiles on primary
+
+oc exec -ti <primary-pod> -c database -n <namespace> –   psql -h localhost -U postgres -c “SELECT * FROM pg_stat_replication;”]]></ac:plain-text-body></ac:structured-macro>
+
+<h3>Troubleshoot Backup Failures</h3>
+<ac:structured-macro ac:name="code" ac:schema-version="1"><ac:parameter ac:name="language">bash</ac:parameter><ac:plain-text-body><![CDATA[# Check backup resource status
+oc get backups.alloydbomni.dbadmin.goog -n <namespace> -o yaml
+
+# Check instance-level backup for detailed error
+
+oc get instancebackups.alloydbomni.internal.dbadmin.goog -n <namespace> -o yaml
+
+# Check backup repository connectivity to StorageGRID
+
+oc get backuprepositories.alloydbomni.internal.dbadmin.goog -n <namespace> -o yaml
+
+# Verify S3 credentials secret exists and is not expired
+
+oc get secret storagegrid-s3-credentials -n <namespace>
+
+# Test StorageGRID connectivity from inside the pod
+
+oc exec -ti <pod-name> -c database -n <namespace> –   curl -sSk https://storagegrid.internal.company.com:18082]]></ac:plain-text-body></ac:structured-macro>
+
+<h2>12.9 Lifecycle Operations</h2>
+
+<h3>Stop / Start a Database Cluster</h3>
+<ac:structured-macro ac:name="code" ac:schema-version="1"><ac:parameter ac:name="language">bash</ac:parameter><ac:plain-text-body><![CDATA[# Stop the database (sets isStopped: true)
+oc patch dbclusters.alloydbomni.dbadmin.goog <name> -n <namespace>   --type=merge -p '{"spec":{"primarySpec":{"isStopped":true}}}'
+
+# Start the database (sets isStopped: false)
+
+oc patch dbclusters.alloydbomni.dbadmin.goog <name> -n <namespace>   –type=merge -p ‘{“spec”:{“primarySpec”:{“isStopped”:false}}}’]]></ac:plain-text-body></ac:structured-macro>
+
+<h3>Update Database Parameters (PostgreSQL GUCs)</h3>
+<ac:structured-macro ac:name="code" ac:schema-version="1"><ac:parameter ac:name="language">bash</ac:parameter><ac:plain-text-body><![CDATA[# Patch database parameters (some require restart, some are reload-only)
+oc patch dbclusters.alloydbomni.dbadmin.goog <name> -n <namespace>   --type=merge -p '{"spec":{"primarySpec":{"parameters":{"max_connections":"200","shared_buffers":"4GB"}}}}']]></ac:plain-text-body></ac:structured-macro>
+
+<h3>Update Resource Allocation (CPU / Memory)</h3>
+<ac:structured-macro ac:name="code" ac:schema-version="1"><ac:parameter ac:name="language">bash</ac:parameter><ac:plain-text-body><![CDATA[# Scale compute resources (triggers pod restart)
+oc patch dbclusters.alloydbomni.dbadmin.goog <name> -n <namespace>   --type=merge -p '{"spec":{"primarySpec":{"resources":{"cpu":"4","memory":"16Gi"}}}}']]></ac:plain-text-body></ac:structured-macro>
+
+<h3>Delete a Database Cluster</h3>
+<ac:structured-macro ac:name="warning" ac:schema-version="1"><ac:rich-text-body><p>Deleting a DBCluster is destructive and removes all associated pods, PVCs, and data. Ensure backups exist on StorageGRID before proceeding. This action cannot be undone.</p></ac:rich-text-body></ac:structured-macro>
+<ac:structured-macro ac:name="code" ac:schema-version="1"><ac:parameter ac:name="language">bash</ac:parameter><ac:plain-text-body><![CDATA[# Verify backup exists first
+oc get backups.alloydbomni.dbadmin.goog -n <namespace>
+
+# Delete the cluster
+
+oc delete dbclusters.alloydbomni.dbadmin.goog <name> -n <namespace>
+
+# Verify cleanup of associated resources
+
+oc get pods,svc,pvc -l alloydbomni.internal.dbadmin.goog/dbcluster=<name> -n <namespace>]]></ac:plain-text-body></ac:structured-macro>
+
+<h3>Annotate for OpenShift SCC</h3>
+<ac:structured-macro ac:name="code" ac:schema-version="1"><ac:parameter ac:name="language">bash</ac:parameter><ac:plain-text-body><![CDATA[# Apply anyuid SCC annotation (required for OpenShift)
+oc annotate dbclusters.alloydbomni.dbadmin.goog <name> -n <namespace>   openshift.io/scc=anyuid]]></ac:plain-text-body></ac:structured-macro>
+
+<hr />
+<h1>13. Security Architecture</h1>
+<p>The AlloyDB Omni Operator implements a defense-in-depth security architecture. In this environment, the security model is enhanced with enterprise Kerberos authentication, HashiCorp Vault for secrets management, and comprehensive audit logging forwarded to Splunk.</p>
+<h2>13.1 Network Security</h2>
+<ul>
+<li><p><strong>TLS Encryption: </strong>All database connections use TLS 1.3 by default (TLS_AES_256_GCM_SHA384 cipher). Webhook communications use cert-manager TLS certificates. Inter-pod replication traffic is also encrypted.</p></li>
+<li><p><strong>Network Policies: </strong>OpenShift’s SDN enforces NetworkPolicy resources to restrict traffic to database pods from only authorized namespaces or pod selectors.</p></li>
+<li><p><strong>Service Exposure Control: </strong>The allowExternalIncomingTraffic flag controls whether database services are accessible from outside the cluster.</p></li>
+<li><p><strong>Air-Gap Boundary: </strong>The disconnected environment ensures no database traffic can egress to the internet. All images, certificates, and configuration are pre-staged internally.</p></li>
+</ul>
+<h2>13.2 Kerberos Authentication &amp; Keytab Integration</h2>
+<p>Database client authentication leverages the enterprise Kerberos infrastructure for single sign-on (SSO) capability. The integration works through the UserDefinedAuthentication CRD and direct PostgreSQL pg_hba.conf configuration managed by the operator.</p>
+<ul>
+<li><p><strong>Kerberos Principal Mapping: </strong>Database users are mapped to Kerberos principals from the enterprise Active Directory or MIT Kerberos KDC. The pg_hba.conf is configured with GSSAPI authentication entries.</p></li>
+<li><p><strong>Keytab File Provisioning: </strong>Kerberos keytab files containing the database service principal’s long-term keys are provisioned as Kubernetes Secrets (from Vault) and mounted into database pods. The keytab allows PostgreSQL to authenticate to the KDC without interactive password entry.</p></li>
+<li><p><strong>pg_hba.conf Configuration: </strong>The operator applies Kerberos authentication rules via the UserDefinedAuthentication CRD, adding GSSAPI entries that specify the Kerberos realm, keytab file path, and user mapping rules.</p></li>
+<li><p><strong>Client Requirements: </strong>Client applications must obtain a valid Kerberos ticket (via kinit or SSPI) before connecting. The PostgreSQL libpq client handles GSSAPI/Kerberos negotiation transparently.</p></li>
+</ul>
+<h2>13.3 HashiCorp Vault Integration (VPM Model)</h2>
+<p>All tenant namespaces use the HashiCorp Vault VPM (Vault Platform Model) for centralized secrets management. Database operational secrets—including admin passwords, backup storage credentials, TLS certificates, and Kerberos keytabs—are stored in the DB Ops Vault path and injected into Kubernetes Secrets:</p>
+<ul>
+<li><p><strong>Vault Secrets Operator (VSO): </strong>Watches VaultStaticSecret or VaultDynamicSecret CRs in tenant namespaces and synchronizes referenced Vault secrets into native Kubernetes Secrets. Ensures DBCluster’s adminUser.passwordRef, backup S3 credentials, and TLS secrets stay in sync with Vault.</p></li>
+<li><p><strong>Vault Agent Sidecar Injection: </strong>Alternative pattern where a Vault Agent init container retrieves secrets at pod startup and renders them into files or environment variables. Used for Kerberos keytab files that need mounting at specific container paths.</p></li>
+<li><p><strong>Vault Policy Scoping: </strong>Each tenant namespace’s ServiceAccount is bound to a Vault role with a policy scoped to only the DB Ops secrets path relevant to that namespace. Strict multi-tenant isolation ensures a namespace can only access its own database secrets.</p></li>
+</ul>
+<ac:structured-macro ac:name="info" ac:schema-version="1"><ac:rich-text-body><p>Secrets lifecycle: Secrets are created and rotated in Vault by the DB Ops team → Vault Secrets Operator synchronizes them to Kubernetes Secrets in the tenant namespace → AlloyDB Omni Operator references these Kubernetes Secrets in DBCluster, BackupPlan, and PgBouncer specs. Password rotation in Vault automatically propagates through this chain.</p></ac:rich-text-body></ac:structured-macro>
+<h2>13.4 Container Security &amp; Audit</h2>
+<ul>
+<li><p><strong>UBI 9 Base Images: </strong>All containers use Red Hat UBI 9 with regular CVE patches. Images are scanned with Aqua Security in the ATAAS-based Quarantine pipeline before promotion to Artifactory.</p></li>
+<li><p><strong>OpenShift SCC Compliance: </strong>The openshift.io/scc=anyuid annotation ensures predictable UID behavior. The operator’s ServiceAccount is explicitly bound to the required SCC.</p></li>
+<li><p><strong>Image Provenance: </strong>All images are pulled exclusively from Artifactory. No external registry access is possible. All images pass Aqua Security scanning in the ATAAS quarantine before reaching production, eliminating supply chain attack vectors.</p></li>
+<li><p><strong>PostgreSQL Audit Logging: </strong>The pgaudit extension provides session and object-level audit trails written to postgresql.audit and forwarded to Splunk.</p></li>
+<li><p><strong>Kubernetes Audit: </strong>OpenShift API server audit logs capture all oc operations against AlloyDB CRDs.</p></li>
+<li><p><strong>Vault Audit: </strong>All Vault secret access operations are logged in Vault’s audit backend, providing traceability of which service accounts accessed which database secrets.</p></li>
+</ul>
+<hr />
+<h1>14. References</h1>
+<table data-layout="default"><colgroup><col /><col /></colgroup><tbody>
+<tr><th style="background-color: #1A73E8; color: #ffffff;"><p><strong>Source</strong></p></th><th style="background-color: #1A73E8; color: #ffffff;"><p><strong>URL</strong></p></th></tr>
+<tr><td style="background-color: #f1f8ff;"><p>AlloyDB Omni for Kubernetes Overview</p></td><td style="background-color: #f1f8ff;"><p>https://cloud.google.com/alloydb/omni/kubernetes/current/docs/overview</p></td></tr>
+<tr><td><p>Install AlloyDB Omni on Kubernetes</p></td><td><p>https://cloud.google.com/alloydb/omni/current/docs/deploy-kubernetes</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>AlloyDB Omni Release Notes</p></td><td style="background-color: #f1f8ff;"><p>https://docs.cloud.google.com/alloydb/omni/docs/release-notes</p></td></tr>
+<tr><td><p>DBCluster CRD Reference (v1.4.0)</p></td><td><p>https://docs.cloud.google.com/alloydb/omni/kubernetes/current/docs/reference/kubernetes-crds-1.4.0/dbcluster</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>High Availability and Data Resilience</p></td><td style="background-color: #f1f8ff;"><p>https://cloud.google.com/alloydb/omni/kubernetes/16.8.0/docs/high-availability/overview</p></td></tr>
+<tr><td><p>PgBouncer Connection Pooler</p></td><td><p>https://docs.cloud.google.com/alloydb/omni/containers/15.7.0/docs/use-connection-pooler-kubernetes</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>Backup and Restore in Kubernetes</p></td><td style="background-color: #f1f8ff;"><p>https://cloud.google.com/alloydb/omni/16.3.0/docs/backup-kubernetes</p></td></tr>
+<tr><td><p>Custom Resource Metrics Reference</p></td><td><p>https://docs.cloud.google.com/alloydb/omni/kubernetes/16.8.0/docs/reference/custom-resource-metrics-kubernetes-operator</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>Sidecar Containers in Kubernetes</p></td><td style="background-color: #f1f8ff;"><p>https://docs.cloud.google.com/alloydb/omni/containers/16.3.0/docs/kubernetes-sidecar-container</p></td></tr>
+<tr><td><p>Configure Log Rotation</p></td><td><p>https://cloud.google.com/alloydb/omni/current/docs/configure-log-rotation</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>Configuration Samples</p></td><td style="background-color: #f1f8ff;"><p>https://docs.cloud.google.com/alloydb/omni/kubernetes/current/docs/samples</p></td></tr>
+<tr><td><p>OperatorHub.io - AlloyDB Omni Operator</p></td><td><p>https://operatorhub.io/operator/alloydb-omni-operator</p></td></tr>
+<tr><td style="background-color: #f1f8ff;"><p>OpenShift cert-manager Operator</p></td><td style="background-color: #f1f8ff;"><p>https://docs.openshift.com/container-platform/4.14/security/cert_manager_operator/cert-manager-operator-install.html</p></td></tr>
+</tbody></table>
+<p><em style="color: #666666;">This document is based on publicly available Google Cloud documentation and internal environment specifications as of March 2026. For the most current information, consult the official Google Cloud documentation at cloud.google.com/alloydb/omni.</em></p>
