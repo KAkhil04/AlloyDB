@@ -154,9 +154,9 @@ fi
 
 #——————————————————————————
 get_mcc_pod() {
-oc -n “$MCO_NS” get pod -l “$MCC_LABEL”   
+{ oc -n “$MCO_NS” get pod -l “$MCC_LABEL”   
 -o jsonpath=’{range .items[?(@.status.phase==“Running”)]}{.metadata.name}{”\n”}{end}’   
-2>/dev/null | head -n1
+2>/dev/null | head -n1; } || true
 }
 
 # Walk ReplicaSet -> Deployment so we know the real “scaling” owner.
@@ -173,14 +173,14 @@ pkind=”$(oc -n “$ns” get rs “$name” -o jsonpath=’{.metadata.ownerRef
 pname=”$(oc -n “$ns” get rs “$name” -o jsonpath=’{.metadata.ownerReferences[0].name}’ 2>/dev/null || true)”
 [[ -n “$pkind” && -n “$pname” ]] && { kind=”$pkind”; name=”$pname”; }
 fi
-printf ‘%s %s’ “${kind:-Unknown}” “${name:-unknown}”
+printf ‘%s %s\n’ “${kind:-Unknown}” “${name:-unknown}”
 }
 
 ready_replicas() {
 local kind=”$1” name=”$2” ns=”$3”
 case “$kind” in
 Deployment|StatefulSet|ReplicaSet)
-oc -n “$ns” get “$kind” “$name” -o jsonpath=’{.status.readyReplicas}’ 2>/dev/null
+oc -n “$ns” get “$kind” “$name” -o jsonpath=’{.status.readyReplicas}’ 2>/dev/null || true
 ;;
 *) echo “” ;;
 esac
@@ -300,7 +300,7 @@ fi
 # 5. Resolve true scaling owner
 
 local kind name
-read -r kind name < <(resolve_scaling_owner “$pod” “$ns”)
+read -r kind name < <(resolve_scaling_owner “$pod” “$ns”) || true
 info “$ns/$pod owner=$kind/$name”
 
 # 6. Owner-kind policy
@@ -398,7 +398,7 @@ else
     fi
 
     local before=$DELETED
-    evaluate_and_act "$pod" "$ns"
+    evaluate_and_act "$pod" "$ns" || warn "evaluation error for $ns/$pod (continuing)"
     if (( DELETED > before )); then
       cycle_deletions=$((cycle_deletions+1))
       sleep 2   # gentle on kube-apiserver
